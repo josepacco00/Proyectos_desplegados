@@ -1,0 +1,14 @@
+[
+    {
+        "ParameterKey": "S3BucketName",
+        "ParameterValue": "<Nombre_de_tu_bucket>"
+    },
+    {
+        "ParameterKey": "DomainName",
+        "ParameterValue": "<Nombre_de_tu_domino>"
+    },
+    {
+        "ParameterKey": "HostedZoneId",
+        "ParameterValue": "<Id_de_tu_HostedZone>"
+    }
+]

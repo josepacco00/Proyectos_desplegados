@@ -1,0 +1,382 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CI/CD pipeline for static website deployment to S3 with CloudFront and custom domain"
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: "Name of the S3 bucket where the website will be deployed"
+  DomainName:
+    Type: String
+    Description: "The domain name for the website (e.g., example.com)"
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: "The Route 53 Hosted Zone ID for the domain"
+  GitHubOwner:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /myproject/GitHubOwner
+  GitHubRepo:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /myproject/GitHubRepo
+  GitHubBranch:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /myproject/GitHubBranch
+  GitHubOAuthToken:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /myproject/GitHubOAuthToken
+    NoEcho: true
+
+Resources:
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub "OAI for ${DomainName}"
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOriginAccessIdentity.S3CanonicalUserId
+            Action: "s3:GetObject"
+            Resource: !Sub "${WebsiteBucket.Arn}/*"
+
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - !Ref DomainName
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          Compress: true
+          DefaultTTL: 86400
+          ForwardedValues:
+            QueryString: false
+          MaxTTL: 31536000
+          MinTTL: 0
+          SmoothStreaming: false
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+        DefaultRootObject: index.html
+        Enabled: true
+        HttpVersion: http2
+        Origins:
+          - DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CloudFrontOriginAccessIdentity}"
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          MinimumProtocolVersion: TLSv1.2_2021
+          SslSupportMethod: sni-only
+
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2 # This is a fixed value for CloudFront distributions
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref PipelineBucket
+        Type: S3
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: "1"
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubOAuthToken
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: S3
+                Version: "1"
+              InputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                BucketName: !Ref WebsiteBucket
+                Extract: "true"
+        - Name: Invalidate
+          # Actions:
+          #   - Name: InvalidateCloudFront
+          #     ActionTypeId:
+          #       Category: Invoke
+          #       Owner: AWS
+          #       Provider: Lambda
+          #       Version: "1"
+          #     Configuration:
+          #       FunctionName: !Ref InvalidationFunction
+          #     InputArtifacts:
+          #       - Name: BuildOutput
+          Actions:
+            - Name: InvalidateCloudFront
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: "1"
+              Configuration:
+                FunctionName: !Ref InvalidationFunction
+              InputArtifacts: []
+              OutputArtifacts: []
+              RunOrder: 1
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        Type: LINUX_CONTAINER
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - echo "No build steps required for static website"
+          artifacts:
+            files:
+              - '**/*'
+
+  PipelineBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${PipelineBucket}
+                  - !Sub arn:aws:s3:::${PipelineBucket}/*
+                  - !Sub arn:aws:s3:::${WebsiteBucket}
+                  - !Sub arn:aws:s3:::${WebsiteBucket}/*
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/myproject/*
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt InvalidationFunction.Arn
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${PipelineBucket}/*
+                  - !Sub arn:aws:s3:::${WebsiteBucket}/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+
+  InvalidationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+
+          def handler(event, context):
+              try:
+                  cloudfront = boto3.client('cloudfront')
+                  codepipeline = boto3.client('codepipeline')
+                  
+                  # Extraer jobId del evento de CodePipeline
+                  job_id = event['CodePipeline.job']['id']
+                  
+                  distribution_id = os.environ['CLOUDFRONT_DISTRIBUTION_ID']
+                  
+                  response = cloudfront.create_invalidation(
+                      DistributionId=distribution_id,
+                      InvalidationBatch={
+                          'Paths': {
+                              'Quantity': 1,
+                              'Items': ['/*']
+                          },
+                          'CallerReference': context.aws_request_id
+                      }
+                  )
+                  
+                  print(f"Invalidation created: {response['Invalidation']['Id']}")
+                  
+                  # Notificar éxito a CodePipeline
+                  codepipeline.put_job_success_result(jobId=job_id)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Invalidation created successfully')
+                  }
+              except Exception as e:
+                  print(f"Error creating invalidation: {str(e)}")
+                  
+                  # Notificar fallo a CodePipeline
+                  codepipeline.put_job_failure_result(
+                      jobId=job_id,
+                      failureDetails={
+                          'type': 'JobFailed',
+                          'message': str(e)
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error creating invalidation: {str(e)}')
+                  }
+
+      Runtime: python3.8
+      Environment:
+        Variables:
+          CLOUDFRONT_DISTRIBUTION_ID: !Ref CloudFrontDistribution
+      Timeout: 60
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudFrontInvalidation
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution.Id}"
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:PutJobSuccessResult
+                  - codepipeline:PutJobFailureResult
+                Resource: "*"
+
+Outputs:
+  WebsiteURL:
+    Value: !Sub "https://${DomainName}"
+    Description: URL for website hosted on S3
